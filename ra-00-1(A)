@@ -1,1 +1,618 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <math.h>
 
+// ═══════════════════════════════════════
+// PIN TANIMLARI
+// ═══════════════════════════════════════
+#define LORA_CS       10
+#define LORA_RST       9
+#define LORA_DIO0      8
+#define FLASH_CS       7
+#define IGNITER_PIN    6
+#define BUZZER_PIN     5
+#define BAT_ADC       A0
+
+// ═══════════════════════════════════════
+// MPU-6050 REGISTER
+// ═══════════════════════════════════════
+#define MPU_ADDR      0x68
+#define MPU_PWR       0x6B
+#define MPU_ACCEL     0x3B
+#define MPU_GYRO      0x43
+#define MPU_ACC_CFG   0x1C
+#define MPU_GYR_CFG   0x1B
+
+// ═══════════════════════════════════════
+// BMP280 REGISTER
+// ═══════════════════════════════════════
+#define BMP_ADDR      0x76
+#define BMP_ID        0xD0
+#define BMP_RESET     0xE0
+#define BMP_CTRL      0xF4
+#define BMP_CONFIG    0xF5
+#define BMP_PRESS     0xF7
+#define BMP_TEMP      0xFA
+#define BMP_CALIB     0x88
+
+// ═══════════════════════════════════════
+// LORA REGISTER
+// ═══════════════════════════════════════
+#define LORA_FIFO         0x00
+#define LORA_OPMODE       0x01
+#define LORA_FR_MSB       0x06
+#define LORA_FR_MID       0x07
+#define LORA_FR_LSB       0x08
+#define LORA_PA_CONFIG    0x09
+#define LORA_FIFO_PTR     0x0D
+#define LORA_FIFO_TX_BASE 0x0E
+#define LORA_IRQ_FLAGS    0x12
+#define LORA_PAYLOAD_LEN  0x22
+#define LORA_MODEM_CFG1   0x1D
+#define LORA_MODEM_CFG2   0x1E
+#define LORA_VERSION      0x42
+#define LORA_SLEEP        0x00
+#define LORA_STDBY        0x01
+#define LORA_TX           0x03
+#define LORA_LORA_MODE    0x80
+
+// ═══════════════════════════════════════
+// DURUM MAKİNESİ
+// ═══════════════════════════════════════
+typedef enum {
+  STATE_INIT,
+  STATE_IDLE,
+  STATE_ARMED,
+  STATE_BOOST,
+  STATE_COAST,
+  STATE_APOGEE,
+  STATE_DESCENT,
+  STATE_LANDED,
+  STATE_ERROR
+} RocketState;
+
+RocketState state = STATE_INIT;
+
+// ═══════════════════════════════════════
+// VERİ YAPILARI
+// ═══════════════════════════════════════
+struct IMUData {
+  float ax, ay, az;
+  float gx, gy, gz;
+  float roll, pitch;
+};
+
+struct BaroData {
+  float temperature;
+  float pressure;
+  float altitude;
+  float altitude_ref;
+};
+
+struct TelemetryPacket {
+  uint8_t  state;
+  float    altitude;
+  float    accel_z;
+  float    velocity;
+  float    roll;
+  float    pitch;
+  uint16_t battery_mv;
+  uint32_t timestamp_ms;
+  uint8_t  checksum;
+} __attribute__((packed));
+
+IMUData       imu;
+BaroData      baro;
+TelemetryPacket telemetry;
+
+// BMP280 kalibrasyon
+struct BMP280Calib {
+  uint16_t T1; int16_t T2, T3;
+  uint16_t P1; int16_t P2, P3, P4, P5, P6, P7, P8, P9;
+} bmp_calib;
+int32_t t_fine;
+
+// Uçuş değişkenleri
+float    velocity     = 0.0f;
+float    prev_alt     = 0.0f;
+uint32_t prev_time    = 0;
+uint8_t  apogee_cnt   = 0;
+float    ref_altitude = 0.0f;
+
+// Zamanlayıcılar
+uint32_t lora_timer   = 0;
+uint32_t flash_timer  = 0;
+uint32_t led_timer    = 0;
+
+// Flash yazma
+uint32_t flash_addr   = 0;
+bool     flash_ok     = false;
+bool     lora_ok      = false;
+bool     mpu_ok       = false;
+bool     bmp_ok       = false;
+
+// ═══════════════════════════════════════
+// YARDIMCI FONKSİYONLAR
+// ═══════════════════════════════════════
+void buzzer_beep(int count, int ms = 100) {
+  for (int i = 0; i < count; i++) {
+    tone(BUZZER_PIN, 2000, ms);
+    delay(ms + 50);
+  }
+}
+
+uint16_t read_battery_mv() {
+  uint32_t raw = analogRead(BAT_ADC);
+  // 100k + 47k gerilim bölücü → çarpan 3.13
+  return (uint16_t)((raw * 3300UL * 313UL) / (4095UL * 100UL));
+}
+
+// ═══════════════════════════════════════
+// MPU-6050
+// ═══════════════════════════════════════
+bool mpu_write(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
+}
+
+bool mpu_read(uint8_t reg, uint8_t* buf, uint8_t len) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  Wire.requestFrom((uint8_t)MPU_ADDR, len);
+  for (uint8_t i = 0; i < len && Wire.available(); i++) buf[i] = Wire.read();
+  return true;
+}
+
+bool mpu_init() {
+  if (!mpu_write(MPU_PWR, 0x00)) return false;   // uyku kapat
+  delay(100);
+  if (!mpu_write(MPU_ACC_CFG, 0x10)) return false; // ±8g
+  if (!mpu_write(MPU_GYR_CFG, 0x08)) return false; // ±500 dps
+  return true;
+}
+
+bool mpu_read_data() {
+  uint8_t buf[14];
+  if (!mpu_read(MPU_ACCEL, buf, 14)) return false;
+
+  int16_t ax_r = (int16_t)(buf[0]  << 8 | buf[1]);
+  int16_t ay_r = (int16_t)(buf[2]  << 8 | buf[3]);
+  int16_t az_r = (int16_t)(buf[4]  << 8 | buf[5]);
+  int16_t gx_r = (int16_t)(buf[8]  << 8 | buf[9]);
+  int16_t gy_r = (int16_t)(buf[10] << 8 | buf[11]);
+  int16_t gz_r = (int16_t)(buf[12] << 8 | buf[13]);
+
+  imu.ax = ax_r / 4096.0f;
+  imu.ay = ay_r / 4096.0f;
+  imu.az = az_r / 4096.0f;
+  imu.gx = gx_r / 65.5f;
+  imu.gy = gy_r / 65.5f;
+  imu.gz = gz_r / 65.5f;
+
+  imu.roll  = atan2f(imu.ay, imu.az) * 180.0f / PI;
+  imu.pitch = atan2f(-imu.ax,
+              sqrtf(imu.ay * imu.ay + imu.az * imu.az)) * 180.0f / PI;
+  return true;
+}
+
+// ═══════════════════════════════════════
+// BMP280
+// ═══════════════════════════════════════
+bool bmp_write(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(BMP_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
+}
+
+uint8_t bmp_read_byte(uint8_t reg) {
+  Wire.beginTransmission(BMP_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)BMP_ADDR, (uint8_t)1);
+  return Wire.read();
+}
+
+bool bmp_read_calib() {
+  Wire.beginTransmission(BMP_ADDR);
+  Wire.write(BMP_CALIB);
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)BMP_ADDR, (uint8_t)24);
+  uint8_t buf[24];
+  for (int i = 0; i < 24; i++) buf[i] = Wire.read();
+
+  bmp_calib.T1 = (uint16_t)(buf[1] << 8 | buf[0]);
+  bmp_calib.T2 = (int16_t) (buf[3] << 8 | buf[2]);
+  bmp_calib.T3 = (int16_t) (buf[5] << 8 | buf[4]);
+  bmp_calib.P1 = (uint16_t)(buf[7] << 8 | buf[6]);
+  bmp_calib.P2 = (int16_t) (buf[9] << 8 | buf[8]);
+  bmp_calib.P3 = (int16_t) (buf[11]<< 8 | buf[10]);
+  bmp_calib.P4 = (int16_t) (buf[13]<< 8 | buf[12]);
+  bmp_calib.P5 = (int16_t) (buf[15]<< 8 | buf[14]);
+  bmp_calib.P6 = (int16_t) (buf[17]<< 8 | buf[16]);
+  bmp_calib.P7 = (int16_t) (buf[19]<< 8 | buf[18]);
+  bmp_calib.P8 = (int16_t) (buf[21]<< 8 | buf[20]);
+  bmp_calib.P9 = (int16_t) (buf[23]<< 8 | buf[22]);
+  return true;
+}
+
+bool bmp_init() {
+  uint8_t id = bmp_read_byte(BMP_ID);
+  if (id != 0x60 && id != 0x58) return false;
+  bmp_read_calib();
+  bmp_write(BMP_CTRL,   0xB7); // normal mode, x4 oversampling
+  bmp_write(BMP_CONFIG, 0x10);
+  delay(100);
+  return true;
+}
+
+bool bmp_read_data() {
+  Wire.beginTransmission(BMP_ADDR);
+  Wire.write(BMP_PRESS);
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)BMP_ADDR, (uint8_t)6);
+  uint8_t buf[6];
+  for (int i = 0; i < 6; i++) buf[i] = Wire.read();
+
+  int32_t adc_P = (int32_t)((buf[0] << 12) | (buf[1] << 4) | (buf[2] >> 4));
+  int32_t adc_T = (int32_t)((buf[3] << 12) | (buf[4] << 4) | (buf[5] >> 4));
+
+  // Sıcaklık
+  int32_t v1 = ((((adc_T >> 3) - ((int32_t)bmp_calib.T1 << 1)))
+               * ((int32_t)bmp_calib.T2)) >> 11;
+  int32_t v2 = (((((adc_T >> 4) - ((int32_t)bmp_calib.T1))
+               * ((adc_T >> 4) - ((int32_t)bmp_calib.T1))) >> 12)
+               * ((int32_t)bmp_calib.T3)) >> 14;
+  t_fine = v1 + v2;
+  baro.temperature = (float)((t_fine * 5 + 128) >> 8) / 100.0f;
+
+  // Basınç
+  int64_t p1 = ((int64_t)t_fine) - 128000;
+  int64_t p2 = p1 * p1 * (int64_t)bmp_calib.P6;
+  p2 += ((p1 * (int64_t)bmp_calib.P5) << 17);
+  p2 += (((int64_t)bmp_calib.P4) << 35);
+  p1  = ((p1 * p1 * (int64_t)bmp_calib.P3) >> 8)
+      + ((p1 * (int64_t)bmp_calib.P2) << 12);
+  p1  = (((((int64_t)1) << 47) + p1)) * ((int64_t)bmp_calib.P1) >> 33;
+  if (p1 == 0) return false;
+  int64_t p = 1048576 - adc_P;
+  p  = (((p << 31) - p2) * 3125) / p1;
+  p1 = (((int64_t)bmp_calib.P9) * (p >> 13) * (p >> 13)) >> 25;
+  p2 = (((int64_t)bmp_calib.P8) * p) >> 19;
+  p  = ((p + p1 + p2) >> 8) + (((int64_t)bmp_calib.P7) << 4);
+  baro.pressure = (float)p / 256.0f;
+
+  // Yükseklik
+  baro.altitude = 44330.0f *
+    (1.0f - powf(baro.pressure / 101325.0f, 0.1903f));
+  return true;
+}
+
+// ═══════════════════════════════════════
+// LoRa
+// ═══════════════════════════════════════
+void lora_write(uint8_t reg, uint8_t val) {
+  digitalWrite(LORA_CS, LOW);
+  SPI.transfer(reg | 0x80);
+  SPI.transfer(val);
+  digitalWrite(LORA_CS, HIGH);
+}
+
+uint8_t lora_read(uint8_t reg) {
+  digitalWrite(LORA_CS, LOW);
+  SPI.transfer(reg & 0x7F);
+  uint8_t val = SPI.transfer(0x00);
+  digitalWrite(LORA_CS, HIGH);
+  return val;
+}
+
+bool lora_init() {
+  digitalWrite(LORA_RST, LOW); delay(10);
+  digitalWrite(LORA_RST, HIGH); delay(10);
+
+  lora_write(LORA_OPMODE, LORA_SLEEP | LORA_LORA_MODE);
+  delay(10);
+
+  if (lora_read(LORA_VERSION) != 0x12) return false;
+
+  // 433 MHz frekans
+  lora_write(LORA_FR_MSB, 0x6C);
+  lora_write(LORA_FR_MID, 0x40);
+  lora_write(LORA_FR_LSB, 0x00);
+
+  lora_write(LORA_PA_CONFIG,  0x8F); // max güç
+  lora_write(LORA_MODEM_CFG1, 0x72); // BW=125kHz, CR=4/5
+  lora_write(LORA_MODEM_CFG2, 0x94); // SF=9, CRC on
+
+  lora_write(LORA_OPMODE, LORA_STDBY | LORA_LORA_MODE);
+  return true;
+}
+
+bool lora_send(TelemetryPacket* pkt) {
+  uint8_t len = sizeof(TelemetryPacket);
+
+  // Checksum
+  uint8_t* p = (uint8_t*)pkt;
+  uint8_t chk = 0;
+  for (uint8_t i = 0; i < len - 1; i++) chk ^= p[i];
+  pkt->checksum = chk;
+
+  lora_write(LORA_FIFO_TX_BASE, 0x00);
+  lora_write(LORA_FIFO_PTR,     0x00);
+
+  digitalWrite(LORA_CS, LOW);
+  SPI.transfer(LORA_FIFO | 0x80);
+  for (uint8_t i = 0; i < len; i++) SPI.transfer(p[i]);
+  digitalWrite(LORA_CS, HIGH);
+
+  lora_write(LORA_PAYLOAD_LEN, len);
+  lora_write(LORA_OPMODE, LORA_TX | LORA_LORA_MODE);
+
+  uint32_t t = millis();
+  while (!(lora_read(LORA_IRQ_FLAGS) & 0x08)) {
+    if (millis() - t > 2000) return false;
+  }
+  lora_write(LORA_IRQ_FLAGS, 0xFF);
+  lora_write(LORA_OPMODE, LORA_STDBY | LORA_LORA_MODE);
+  return true;
+}
+
+// ═══════════════════════════════════════
+// W25Q64 SPI FLASH
+// ═══════════════════════════════════════
+void flash_cmd(uint8_t cmd) {
+  digitalWrite(FLASH_CS, LOW);
+  SPI.transfer(cmd);
+  digitalWrite(FLASH_CS, HIGH);
+}
+
+void flash_wait() {
+  digitalWrite(FLASH_CS, LOW);
+  SPI.transfer(0x05); // Read Status
+  while (SPI.transfer(0) & 0x01);
+  digitalWrite(FLASH_CS, HIGH);
+}
+
+bool flash_init() {
+  digitalWrite(FLASH_CS, LOW);
+  SPI.transfer(0x9F); // JEDEC ID
+  uint8_t m = SPI.transfer(0);
+  SPI.transfer(0); SPI.transfer(0);
+  digitalWrite(FLASH_CS, HIGH);
+  return (m == 0xEF); // Winbond
+}
+
+void flash_erase_chip() {
+  flash_cmd(0x06); // Write Enable
+  flash_cmd(0xC7); // Chip Erase
+  flash_wait();
+  flash_addr = 0;
+}
+
+void flash_write_page(uint32_t addr, uint8_t* data, uint16_t len) {
+  flash_cmd(0x06); // Write Enable
+  digitalWrite(FLASH_CS, LOW);
+  SPI.transfer(0x02); // Page Program
+  SPI.transfer((addr >> 16) & 0xFF);
+  SPI.transfer((addr >>  8) & 0xFF);
+  SPI.transfer( addr        & 0xFF);
+  for (uint16_t i = 0; i < len; i++) SPI.transfer(data[i]);
+  digitalWrite(FLASH_CS, HIGH);
+  flash_wait();
+}
+
+// ═══════════════════════════════════════
+// SETUP
+// ═══════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("=== Roket Aviyonik Baslıyor ===");
+
+  // Pin modları
+  pinMode(IGNITER_PIN, OUTPUT);
+  pinMode(BUZZER_PIN,  OUTPUT);
+  pinMode(LORA_CS,     OUTPUT);
+  pinMode(LORA_RST,    OUTPUT);
+  pinMode(LORA_DIO0,   INPUT);
+  pinMode(FLASH_CS,    OUTPUT);
+
+  // Güvenlik — igniter pasif
+  digitalWrite(IGNITER_PIN, LOW);
+  digitalWrite(LORA_CS,     HIGH);
+  digitalWrite(FLASH_CS,    HIGH);
+  digitalWrite(LORA_RST,    HIGH);
+
+  // I2C & SPI başlat
+  Wire.begin();
+  Wire.setClock(400000);
+  SPI.begin();
+  SPI.setClockDivider(SPI_CLOCK_DIV8);
+
+  // MPU-6050
+  mpu_ok = mpu_init();
+  Serial.print("MPU-6050: ");
+  Serial.println(mpu_ok ? "OK" : "HATA");
+
+  // BMP280
+  bmp_ok = bmp_init();
+  Serial.print("BMP280:   ");
+  Serial.println(bmp_ok ? "OK" : "HATA");
+
+  // LoRa
+  lora_ok = lora_init();
+  Serial.print("LoRa:     ");
+  Serial.println(lora_ok ? "OK" : "HATA");
+
+  // Flash
+  flash_ok = flash_init();
+  Serial.print("Flash:    ");
+  Serial.println(flash_ok ? "OK" : "HATA");
+  if (flash_ok) flash_erase_chip();
+
+  // Referans yüksekliği
+  if (bmp_ok) {
+    for (int i = 0; i < 10; i++) {
+      bmp_read_data();
+      delay(50);
+    }
+    ref_altitude = baro.altitude;
+    prev_alt     = baro.altitude;
+    Serial.print("Referans yukseklik: ");
+    Serial.print(ref_altitude); Serial.println(" m");
+  }
+
+  // Hata kontrolü
+  if (!mpu_ok || !bmp_ok) {
+    state = STATE_ERROR;
+    buzzer_beep(5, 200);
+    Serial.println("KRITIK HATA: Sensor baslatma basarisiz!");
+    return;
+  }
+
+  state = STATE_IDLE;
+  buzzer_beep(2);
+  prev_time = millis();
+  Serial.println("Sistem hazir — STATE_IDLE");
+}
+
+// ═══════════════════════════════════════
+// LOOP
+// ═══════════════════════════════════════
+void loop() {
+  uint32_t now = millis();
+
+  // Sensör oku
+  if (mpu_ok) mpu_read_data();
+  if (bmp_ok) bmp_read_data();
+
+  // Hız hesapla
+  float dt = (now - prev_time) / 1000.0f;
+  if (dt > 0.001f) {
+    velocity = (baro.altitude - prev_alt) / dt;
+  }
+  prev_alt  = baro.altitude;
+  prev_time = now;
+
+  float rel_alt = baro.altitude - ref_altitude;
+
+  // ─── DURUM MAKİNESİ ───
+  switch (state) {
+
+    case STATE_INIT:
+      state = STATE_IDLE;
+      break;
+
+    case STATE_IDLE:
+      // LED yavaş yanıp söner
+      if (now - led_timer > 800) {
+        led_timer = now;
+        digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+      }
+      // Seri porttan 'A' gönderince armed
+      if (Serial.available() && Serial.read() == 'A') {
+        state = STATE_ARMED;
+        buzzer_beep(3);
+        Serial.println("STATE: ARMED");
+      }
+      Serial.print("IDLE | Alt:");
+      Serial.print(rel_alt, 1);
+      Serial.print("m | Bat:");
+      Serial.print(read_battery_mv());
+      Serial.println("mV");
+      delay(500);
+      break;
+
+    case STATE_ARMED:
+      // İvme > 3g → fırlatma tespit edildi
+      if (fabsf(imu.az) > 3.0f) {
+        state = STATE_BOOST;
+        Serial.println("STATE: BOOST");
+      }
+      break;
+
+    case STATE_BOOST:
+      // İvme < 1.5g ve yükseklik > 20m → motor söndü
+      if (fabsf(imu.az) < 1.5f && rel_alt > 20.0f) {
+        state = STATE_COAST;
+        Serial.println("STATE: COAST");
+      }
+      break;
+
+    case STATE_COAST:
+      // Hız negatife döndü VE ivme düşük → apogee yaklaşıyor
+      if (velocity < -0.5f && fabsf(imu.az) < 1.2f) {
+        apogee_cnt++;
+        if (apogee_cnt >= 3) {
+          state = STATE_APOGEE;
+          Serial.print("STATE: APOGEE | Alt:");
+          Serial.println(rel_alt, 1);
+        }
+      } else {
+        apogee_cnt = 0;
+      }
+      break;
+
+    case STATE_APOGEE:
+      // Paraşüt ateşle
+      Serial.println("PARASUT ATESLENDI!");
+      digitalWrite(IGNITER_PIN, HIGH);
+      delay(500);
+      digitalWrite(IGNITER_PIN, LOW);
+      buzzer_beep(1, 500);
+      state = STATE_DESCENT;
+      break;
+
+    case STATE_DESCENT:
+      // Hız sıfıra yakın ve alçak → indi
+      if (fabsf(velocity) < 0.3f && rel_alt < 10.0f) {
+        state = STATE_LANDED;
+        Serial.println("STATE: LANDED");
+      }
+      break;
+
+    case STATE_LANDED:
+      // Sürekli bip
+      tone(BUZZER_PIN, 2500, 300);
+      delay(600);
+      break;
+
+    case STATE_ERROR:
+      // Hızlı yanıp sönen bip
+      tone(BUZZER_PIN, 1000, 100);
+      delay(200);
+      break;
+  }
+
+  // ─── LORA TELEMETRİ (500ms) ───
+  if (lora_ok && now - lora_timer > 500) {
+    lora_timer = now;
+    telemetry.state       = (uint8_t)state;
+    telemetry.altitude    = rel_alt;
+    telemetry.accel_z     = imu.az;
+    telemetry.velocity    = velocity;
+    telemetry.roll        = imu.roll;
+    telemetry.pitch       = imu.pitch;
+    telemetry.battery_mv  = read_battery_mv();
+    telemetry.timestamp_ms= now;
+    lora_send(&telemetry);
+  }
+
+  // ─── FLASH KAYIT (200ms) ───
+  if (flash_ok && flash_addr < 0x7FFFFF &&
+      now - flash_timer > 200 &&
+      state >= STATE_ARMED) {
+    flash_timer = now;
+    struct FlashRecord {
+      uint32_t ts;
+      float alt, vel, ax, ay, az;
+      uint8_t st;
+    } rec = { now, rel_alt, velocity,
+               imu.ax, imu.ay, imu.az, (uint8_t)state };
+    flash_write_page(flash_addr, (uint8_t*)&rec, sizeof(rec));
+    flash_addr += sizeof(rec);
+  }
+}
